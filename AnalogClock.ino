@@ -4,20 +4,28 @@
 // This sketch uses an ESP8266 on a WEMOS D1 Mini board to retrieve the time 
 // from an NTP server and pulse the Lavet motor on an inexpensive analog quartz
 // clock to keep the clock in sync with local time. The ESP8266 stores the position 
-// of the clock's hour, minute and second hands in I2C Serial EERAM.
+// of the clock's hour, minute and second hands in I2C Serial EERAM. NTP time 
+// and analog clock time are display in the serial monitor once each second.
 //
-// This version uses the ESPAsyncWebServer library which seems to be faster than the
-// ESP8266WebServer library but which is incompatible with the ESPTelnet library.
+// on startup:
+//    YELLOW LED flashes while waiting to connect to WiFi
+//    PURPLE LED flashes while waiting to connect to the NTP server
+//    BLUE LED flashes while waiting for input from the setup web page
+//
+// after startup:
+//    GREEN LED flashes during normal operation
+//    RED LED flashes if unable to sync with NTP server
+//    WHITE LED flashes while the analog clock's hands are stopped waiting for actual time to catch up
+//
 //--------------------------------------------------------------------------
 
-#define VERSION "2.5"
+#define VERSION "2.6"
 
 #include <TimeLib.h>
 #include <ESP8266WiFi.h>
 #include <NtpClientLib.h>                       // https://github.com/gmag11/NtpClient
 #include <Ticker.h>
 #include <EERAM.h>                              // https://github.com/MajenkoLibraries/EERAM/
-#include <ESPAsyncTCP.h>                        // https://github.com/me-no-dev/ESPAsyncTCP
 #include <ESPAsyncWebServer.h>                  // https://github.com/me-no-dev/ESPAsyncWebServer
 #include <TelnetPrint.h>                        // https://github.com/JAndrassy/TelnetStream/
 
@@ -45,12 +53,13 @@
 #define BLUELED D8                              // output to blue part of the RGB LED
 #define SWITCHPIN D6                            // input from push button switch
 
+#define title "ESP8266 WiFi Analog Clock"
+
 #define DEBOUNCE 50                             // 50 milliseconds to debounce the pushbutton switch
 #define PULSETIME 30                            // 30 millisecond pulse for the clock's lavet motor
-#define UPDATEINTERVAL 10                       // NTP update every 10 minutes 
 
-#define WIFISSID "*********"
-#define PASSWORD "*********"    
+#define WIFISSID ".........."
+#define PASSWORD ".........."    
 
 #define HOUR     0x0000                         // address in EERAM for analogClkHour
 #define MINUTE   HOUR+1                         // address in EERAM for analogClkMinute
@@ -59,22 +68,25 @@
 #define CHECK1   HOUR+4                         // address in EERAM for 1st check byte 0xAA
 #define CHECK2   HOUR+5                         // address in EERAM for 2nd check byte 0x55
 
+#define NTPSERVERNAME "time.nist.gov"
 //#define NTPSERVERNAME "0.us.pool.ntp.org"
-  #define NTPSERVERNAME "time.nist.gov"
 //#define NTPSERVERNAME "time.windows.com"
 //#define NTPSERVERNAME "time.google.com"
-//#define NTPSERVERNAME "time-a-g.nist.gov"     // NIST, Gaithersburg, Maryland
+//#define NTPSERVERNAME "time-a-g.nist.gov"
+#define LONGINTERVAL 600                        // re-sync with the NTP server every 600 seconds
+#define SHORTINTERVAL 10                        // if the time has not been set, re-try the NTP server every 10 seconds
 
 AsyncWebServer server(80);
 EERAM eeRAM;
 time_t analogClkTime;
 IPAddress ip;
 Ticker pulseTimer,clockTimer,ledTimer;
-NTPSyncEvent_t ntpEvent;                        // time last NTP event triggered
+NTPSyncEvent_t ntpEvent;
 String lastSyncTime = "";
-boolean syncEventTriggered = false;             // if an NTP time sync event has been triggered
-boolean printTime = false;                      // print NTP and clock's time
-byte analogClktimeZone=5;                       // default to EST
+String NTPtime, clockTime;
+boolean syncEventTriggered = false;             // true if an NTP time sync event has been triggered
+boolean printTime = false;                      // if true, print NTP and clock's time
+byte analogClktimeZone=5;                       // GMT -5 = EST
 byte analogClkHour=0;
 byte analogClkMinute=0;
 byte analogClkSecond=0;
@@ -82,11 +94,10 @@ byte analogClkWeekday=0;
 byte analogClkDay=0;
 byte analogClkMonth=0;
 byte analogClkYear=0;
+int activeLED = GREENLED;
 
 void ICACHE_RAM_ATTR pinInterruptISR();         // ISR functions should be defined with ICACHE_RAM_ATTR attribute
-void blueLEDoff();
-void greenLEDoff();
-void redLEDoff();
+void LEDsoff();
 void pulseOff();
 void checkClock();
 void processSyncEvent(NTPSyncEvent_t ntpEvent);
@@ -95,6 +106,7 @@ void processSyncEvent(NTPSyncEvent_t ntpEvent);
 // Setup
 //--------------------------------------------------------------------------
 void setup() {
+
   // configure hardware...
   eeRAM.begin(SDA,SCL);
   pinMode(SWITCHPIN,INPUT_PULLUP);
@@ -115,10 +127,10 @@ void setup() {
   unsigned long waitTime = millis()+500;
   while(millis() < waitTime) yield();           // wait 500 milliseconds for the serial port
    
-  Serial.printf("\n\nESP8266 Analog Clock Version %s\n\n",VERSION);
+  Serial.printf("\n\n%s\n",title);
   Serial.printf("Sketch size: %u\n",ESP.getSketchSize());
   Serial.printf("Free size: %u\n",ESP.getFreeSketchSpace());
-  Serial.println(ESP.getResetReason()+ " Reset");     
+  Serial.printf("%s Reset\n",ESP.getResetReason().c_str());
 
   // connect to WiFi...
   Serial.printf("\nConnecting to %s",WIFISSID);
@@ -131,7 +143,7 @@ void setup() {
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
       digitalWrite(REDLED,HIGH);                // flash the red LED once each second while waiting to connect to WiFi
-      ledTimer.once_ms(100,redLEDoff);
+      ledTimer.once_ms(100,LEDsoff);
       Serial.print(".");                        // print '.' every second
       if (--waitCount==0) ESP.restart();        // if WiFi not connected after 60 seconds, restart the ESP8266      
     }
@@ -156,12 +168,12 @@ void setup() {
     analogClktimeZone = eeRAM.read(TIMEZONE); 
 
     server.on("/",HTTP_GET,[](AsyncWebServerRequest *request){
-      request->send_P(200,"text/html",statuspage);
+      request->send(200,"text/html",statuspage);
     });
 
     server.on("/time",HTTP_GET,[](AsyncWebServerRequest *request){
       String timeStr = NTP.getTimeStr(analogClkTime)+" "+NTP.getTimeStr(NTP.getLastNTPSync())+" "+NTP.getUptimeString();
-      request->send_P(200,"text/plain",timeStr.c_str());
+      request->send(200,"text/plain",timeStr.c_str());      
     });  
   }
    
@@ -179,7 +191,7 @@ void setup() {
       // save the values from the setup page in EERAM
       byte params = request->params();
         for(int i=0;i<params;i++){
-        AsyncWebParameter* p = request->getParam(i);
+        const AsyncWebParameter* p = request->getParam(i);
         eeRAM.write(i,atoi(p->value().c_str()));
         Serial.printf("%s: %s\n",p->name().c_str(),p->value().c_str());
       }
@@ -194,7 +206,7 @@ void setup() {
       if (lastSeconds != seconds) {
         lastSeconds = seconds;
         digitalWrite(BLUELED,HIGH);             // flash the blue LED once each second while waiting for input to the web page
-        ledTimer.once_ms(100,blueLEDoff);
+        ledTimer.once_ms(100,LEDsoff);
       }
     }
   }
@@ -204,7 +216,7 @@ void setup() {
   NTP.setDSTZone(DST_ZONE_USA);                      // use US rules for switching between standard and daylight saving time
   NTP.setDayLight(true);                             // yes to daylight saving time   
   NTP.onNTPSyncEvent([](NTPSyncEvent_t event){ntpEvent=event;syncEventTriggered=true;});
-  NTP.setInterval(UPDATEINTERVAL,UPDATEINTERVAL*60); // ten seconds, 10 minutes 
+  NTP.setInterval(SHORTINTERVAL,LONGINTERVAL);
 
   waitCount = 60;                                    // 60 seconds
   Serial.print("\nWaiting for sync with NTP server");   
@@ -213,14 +225,14 @@ void setup() {
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      digitalWrite(REDLED,HIGH);                     // flash the red LED once each second while waiting to connect to the NTP server
-      ledTimer.once_ms(100,redLEDoff);
+      digitalWrite(REDLED,HIGH);                     // LED flashes PURPLE while waiting to connect to the NTP server
+      digitalWrite(BLUELED,HIGH);
+      ledTimer.once_ms(100,LEDsoff);
       Serial.print(".");                             // print '.' every second
       if (--waitCount==0) ESP.restart();             // if the time is not set after 60 seconds, restart the ESP8266      
     }
   }    
   Serial.println("\nSynced with "+NTP.getNtpServerName());
-  digitalWrite(REDLED,LOW);                          // turn off the red LED  
       
   analogClkWeekday=weekday();                        // take initial values for weekday...
   analogClkDay=day();                                // and day... 
@@ -242,18 +254,28 @@ void loop() {
    
   // once each second....
   byte secs = second();  
-  if (lastSeconds != secs) {
-    lastSeconds = secs;   
-    digitalWrite(GREENLED,HIGH);                // turn on the green LED       
-    ledTimer.once_ms(100,greenLEDoff);          // turn off the green LED after 100 milliseconds
-  }
+    if (lastSeconds != secs) {
+      lastSeconds = secs;   
+        if (analogClkTime > now()) {
+          digitalWrite(BLUELED,HIGH);           // LED flashes WHITE if waiting for actual time to catch up to analog clock time                 
+          digitalWrite(GREENLED,HIGH);                          
+          digitalWrite(REDLED,HIGH);             
+      }
+      else {
+        digitalWrite(activeLED,HIGH);           // else, LED flashes GREEN during normal operation
+      }
+
+      ledTimer.once_ms(100,LEDsoff);
+    }
 
   // if either ESP8266's internal time or analog clock's time has changed...
   if (printTime) {
     printTime = false;       
     // print ESP8266's internal time and analog clock time
-    Serial.println(NTP.getTimeStr(now())+"\t"+NTP.getTimeStr(analogClkTime));
-    TelnetPrint.println(NTP.getTimeStr(now())+"\t"+NTP.getTimeStr(analogClkTime));
+    NTPtime = NTP.getTimeStr(now());
+    clockTime= NTP.getTimeStr(analogClkTime);
+    Serial.println(NTPtime+"\t"+clockTime);
+    TelnetPrint.println(NTPtime+"\t"+clockTime);
   }
     
   // process any NTP events
@@ -264,18 +286,12 @@ void loop() {
 } // end of loop()
 
 //------------------------------------------------------------------------
-// Ticker callbacks that turn off the LEDs after 100 milliseconds.
+// Ticker callback that turns off the LEDs after 100 milliseconds.
 //-------------------------------------------------------------------------
-void blueLEDoff(){
-  digitalWrite(BLUELED,LOW);                          
-}
-
-void greenLEDoff(){
-  digitalWrite(GREENLED,LOW);                          
-}
-
-void redLEDoff(){
-  digitalWrite(REDLED,LOW);  
+void LEDsoff(){
+   digitalWrite(BLUELED,LOW);                          
+   digitalWrite(GREENLED,LOW);                          
+   digitalWrite(REDLED,LOW);                          
 }
 
 //--------------------------------------------------------------------------
@@ -337,47 +353,50 @@ void checkClock() {
  
   // this part was added so that the times are printed when the analog clock's hands are stopped waiting for the ESP8266's internal time to catch up
   byte secs = second();  
-  if (lastSeconds != secs) {                  // when the ESP8266's internal time changes...
-    lastSeconds = secs;                       // save for next time 
-    printTime = true;                         // set flag to print new time 
+  if (lastSeconds != secs) {                    // when the ESP8266's internal time changes...
+    lastSeconds = secs;                         // save for next time 
+    printTime = true;                           // set flag to print new time 
   }  
  }
 
 //--------------------------------------------------------------------------
-// NTP event handler
+// NTP client event handler
 //--------------------------------------------------------------------------
 void processSyncEvent(NTPSyncEvent_t ntpEvent) {
-  if (ntpEvent) {
-    if (ntpEvent == noResponse) {
-      Serial.println("Time Sync error: NTP server not reachable");
-      TelnetPrint.println("Time Sync error: NTP server not reachable");
-    }
-    else if (ntpEvent == invalidAddress) {
-      Serial.println("Time Sync error: Invalid NTP server address");
-      TelnetPrint.println("Time Sync error: Invalid NTP server address");        
-    }
-    else if (ntpEvent == errorSending) {
-      Serial.println("Time Sync error: An error occurred while sending the NTP request");
-      TelnetPrint.println("Time Sync error: An error occurred while sending the NTP request");      
-    }
-    else if (ntpEvent == responseError) {
-      Serial.println("Time Sync error: Wrong NTP response received");
-      TelnetPrint.println("Time Sync error: Wrong NTP response received");  
-    } 
-  }     
-  else {
-    lastSyncTime = NTP.getTimeStr(NTP.getLastNTPSync());
-    Serial.print("Got NTP time: "+lastSyncTime);
-    TelnetPrint.print("Got NTP time: "+lastSyncTime);     
-    if (NTP.isSummerTime()){ 
-      Serial.println("  Daylight Saving Time");
-      TelnetPrint.println("  Daylight Saving Time");        
-    }
-    else {
-      Serial.println("  Standard Time");
-      TelnetPrint.println("  Standard Time");        
-    }
-  }
+  static unsigned long startMillis,stopMillis;
+   switch(ntpEvent) {
+      case timeSyncd:
+         stopMillis = millis();
+         Serial.printf("%s responded in %s milliseconds\n",NTPSERVERNAME,String(stopMillis-startMillis));
+         TelnetPrint.printf("%s responded in %s milliseconds\n",NTPSERVERNAME,String(stopMillis-startMillis));
+         lastSyncTime = NTP.getTimeStr(NTP.getLastNTPSync());
+         activeLED = GREENLED;
+         break;
+      case noResponse:
+         Serial.println("Time Sync error: No response from NTP server");
+         TelnetPrint.println("Time Sync error: No response from NTP server");      
+         activeLED = REDLED;   
+         break;
+      case invalidAddress:
+         Serial.println("Time Sync error: NTP server not reachable");      
+         TelnetPrint.println("Time Sync error: NTP server not reachable");
+         activeLED = REDLED;   
+         break;
+      case requestSent:
+         startMillis=millis();      
+         Serial.println("NTP request sent, waiting for response...");
+         TelnetPrint.println("NTP request sent, waiting for response...");      
+         break;
+      case errorSending:
+         Serial.println("Time Sync error: An error occurred while sending the request to the NTP server");      
+         TelnetPrint.println("Time Sync error: An error occurred while sending the request to the NTP server");
+         activeLED = REDLED;   
+         break;
+      case responseError:
+         Serial.println("Time Sync error: Wrong response received from the NTP server");
+         TelnetPrint.println("Time Sync error: Wrong response received from the NTP server");      
+         activeLED = REDLED;   
+   }    
 }
 
 //--------------------------------------------------------------------------
