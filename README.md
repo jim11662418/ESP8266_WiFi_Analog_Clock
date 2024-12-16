@@ -36,7 +36,7 @@ The very first time that the sketch is run, the user will be directed to a simpl
 <p align="center">Arduino Serial Monitor During Analog Clock Startup</p>
 <br />
 <br />
-Once the ESP8266 finishes its initialazation and starts operation, it serves a simple web page showing the clock's status. The status page can optionally show a graphic image representing the clock's Face drawn using Scalable Vector Graphics, or HTML Canvas, or no image at all.
+Once the ESP8266 finishes its initialization and starts operation, it serves a simple web page showing the clock's status. The status page can optionally show a graphic image representing the clock's Face drawn using Scalable Vector Graphics, or HTML Canvas, or no image at all.
 <br />
 <br />
 <p align="center"><img src="/images/screen3.jpg"/>
