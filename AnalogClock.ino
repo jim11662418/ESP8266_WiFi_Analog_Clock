@@ -17,7 +17,6 @@
 //    RGB LED flashes RED if unable to sync with NTP server
 //    RGB LED flashes WHITE while the analog clock's hands are stopped waiting for actual time to catch up
 //
-//    https://www.w3schools.com/colors/colors_picker.asp for RGB LED values
 //--------------------------------------------------------------------------
 
 #include <TimeLib.h>
@@ -52,8 +51,7 @@
 #define BLUELED D8                                    // output to blue part of the RGB LED
 #define SWITCHPIN D6                                  // input from push button switch
 
-#define title "ESP8266 WiFi Analog Clock"
-#define VERSION "2.7"
+#define TITLE "ESP8266 WiFi Analog Clock Version 2.7"
 
 #define DEBOUNCE 50                                   // 50 milliseconds to debounce the pushbutton switch
 #define PULSETIME 30                                  // 30 millisecond pulse for the clock's lavet motor
@@ -99,8 +97,17 @@ byte analogClkYear=0;
 bool NTPissue = false;
 unsigned long startMillis,stopMillis;
 
+// RGB LED colors - https://www.w3schools.com/colors/colors_picker.asp
+int RGBred[]    = {255,0,0};
+int RGBblue[]   = {0,255,0};
+int RGBgreen[]  = {0,0,255};
+int RGByellow[] = {255,255,0};
+int RGBpurple[] = {255,0,255};
+int RGBwhite[]  = {255,255,255};
+
+// prototypes
 void ICACHE_RAM_ATTR pinInterruptISR();               // ISR functions should be defined with ICACHE_RAM_ATTR attribute
-void setRGBLED(int red,int green,int blue);
+void setRGBLED(int* arr);
 void RGBLEDoff();
 void pulseOff();
 void checkClock();
@@ -128,7 +135,7 @@ void setup() {
   unsigned long waitTime = millis()+500;
   while(millis() < waitTime) yield();                 // wait 500 milliseconds for the serial port
    
-  Serial.printf("\n\n%s Version %s\n",title,VERSION);
+  Serial.printf("\n\n%s\n",TITLE);
   Serial.printf("Chip ID: %u\n",ESP.getChipId());
   Serial.printf("CPU Frequency: %u\n",ESP.getCpuFreqMHz());    
   Serial.printf("Sketch size: %u\n",ESP.getSketchSize());
@@ -146,7 +153,7 @@ void setup() {
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      setRGBLED(255,255,0);                           // RGB LED flashes YELLOW while waiting to connect to WiFi   
+      setRGBLED(RGByellow);                           // RGB LED flashes YELLOW while waiting to connect to WiFi   
       Serial.print(".");                              // print '.' every second
       if (--waitCount==0) ESP.restart();              // if WiFi not connected after 60 seconds, restart the ESP8266      
     }
@@ -184,16 +191,16 @@ void setup() {
   else {
     Serial.printf("\nBrowse to %s to set up the Analog Clock.\n\r",WiFi.localIP().toString().c_str());
       
-    server.on("/",HTTP_GET,[](AsyncWebServerRequest *request){
+    server.on("/",HTTP_GET,[](AsyncWebServerRequest *request) {
       request->send_P(200,"text/html",setuppage);
     });
 
-    server.on("/post",HTTP_POST,[](AsyncWebServerRequest * request) {
+    server.on("/post",HTTP_POST,[](AsyncWebServerRequest *request){ 
       request->send_P(200,"text/plain","OK, Bye");
 
       // save the values from the setup page in EERAM
       byte params = request->params();
-        for(int i=0;i<params;i++){
+      for(int i=0;i<params;i++){
         const AsyncWebParameter* p = request->getParam(i);
         eeRAM.write(i,atoi(p->value().c_str()));
         Serial.printf("%s: %s\n",p->name().c_str(),p->value().c_str());
@@ -207,18 +214,18 @@ void setup() {
       byte seconds = second();  
       if (lastSeconds != seconds) {
         lastSeconds = seconds;
-        setRGBLED(0,0,255);                           // RGB LED flashes BLUE while waiting to connect to WiFi           
+        setRGBLED(RGBblue);                           // RGB LED flashes BLUE while waiting to connect to WiFi           
       }
     }
   }
 
   // connect to the NTP server...
+  startMillis=millis();                               // let's see how long this takes  
   NTP.begin(NTPSERVERNAME,-analogClktimeZone,true);   // start the NTP client
   NTP.setDSTZone(DST_ZONE_USA);                       // use US rules for switching between standard and daylight saving time
   NTP.setDayLight(true);                              // yes to daylight saving time   
   NTP.onNTPSyncEvent([](NTPSyncEvent_t event){ntpEvent=event;syncEventTriggered=true;});
   NTP.setInterval(SHORTINTERVAL,LONGINTERVAL);
-  startMillis=millis();  
 
   waitCount = 60;                                     // 60 seconds
   Serial.print("\nWaiting for sync with NTP server");   
@@ -227,7 +234,7 @@ void setup() {
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      setRGBLED(255,0,255);                           // RGB LED flashes PURPLE while waiting to connect to NTP server
+      setRGBLED(RGBpurple);                           // RGB LED flashes PURPLE while waiting to connect to NTP server
       Serial.print(".");                              // print '.' every second
       if (--waitCount==0) ESP.restart();              // if the time is not set after 60 seconds, restart the ESP8266      
     }
@@ -257,14 +264,14 @@ void loop() {
     if (lastSeconds != secs) {
       lastSeconds = secs;   
         if (analogClkTime > now()) {
-          setRGBLED(255,255,255);                     // RGB LED flashes WHITE while waiting to connect to WiFi                     
+          setRGBLED(RGBwhite);                        // RGB LED flashes WHITE while waiting to connect to WiFi                     
       }
       else {
         if (NTPissue) {
-          setRGBLED(255,0,0);                         // RGB LED flashes RED if there's an issue with the NTP server
+          setRGBLED(RGBred);                          // RGB LED flashes RED if there's an issue with the NTP server
         }
         else {
-          setRGBLED(0,255,0);                         // RGB LED flashes GREEN
+          setRGBLED(RGBgreen);                        // RGB LED flashes GREEN
         }
       }
     }
@@ -289,10 +296,10 @@ void loop() {
 //------------------------------------------------------------------------
 // flash the RGB LED
 //-------------------------------------------------------------------------
-void setRGBLED(int red,int green,int blue){
-  analogWrite(REDLED,red);
-  analogWrite(GREENLED,green);
-  analogWrite(BLUELED,blue);
+void setRGBLED(int* colors){
+  analogWrite(REDLED,colors[0]);
+  analogWrite(BLUELED,colors[1]);
+  analogWrite(GREENLED,colors[2]);
   ledTimer.once_ms(100,RGBLEDoff);    
 }    
 
