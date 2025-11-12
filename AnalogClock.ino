@@ -20,8 +20,6 @@
 //    https://www.w3schools.com/colors/colors_picker.asp for RGB LED values
 //--------------------------------------------------------------------------
 
-#define VERSION "2.6"
-
 #include <TimeLib.h>
 #include <ESP8266WiFi.h>
 #include <NtpClientLib.h>                             // https://github.com/gmag11/NtpClient
@@ -55,6 +53,7 @@
 #define SWITCHPIN D6                                  // input from push button switch
 
 #define title "ESP8266 WiFi Analog Clock"
+#define VERSION "2.7"
 
 #define DEBOUNCE 50                                   // 50 milliseconds to debounce the pushbutton switch
 #define PULSETIME 30                                  // 30 millisecond pulse for the clock's lavet motor
@@ -76,7 +75,6 @@
 //#define NTPSERVERNAME "time.nist.gov"
   #define NTPSERVERNAME "time.windows.com"
 //#define NTPSERVERNAME "time.google.com"
-//#define NTPSERVERNAME "time-a-g.nist.gov"
 
 #define LONGINTERVAL 600                              // re-sync with the NTP server every 600 seconds
 #define SHORTINTERVAL 10                              // if the time has not been set, re-try the NTP server every 10 seconds
@@ -98,9 +96,11 @@ byte analogClkWeekday=0;
 byte analogClkDay=0;
 byte analogClkMonth=0;
 byte analogClkYear=0;
-int activeLED = GREENLED;
+bool NTPissue = false;
+unsigned long startMillis,stopMillis;
 
 void ICACHE_RAM_ATTR pinInterruptISR();               // ISR functions should be defined with ICACHE_RAM_ATTR attribute
+void setRGBLED(int red,int green,int blue);
 void RGBLEDoff();
 void pulseOff();
 void checkClock();
@@ -120,24 +120,24 @@ void setup() {
   pinMode(REDLED,OUTPUT);
   pinMode(GREENLED,OUTPUT);
   pinMode(BLUELED,OUTPUT);
-  digitalWrite(COIL1,LOW);
-  digitalWrite(COIL2,LOW);
-  analogWrite(REDLED,0);
-  analogWrite(GREENLED,0);
-  analogWrite(BLUELED,0);
+  pulseOff();
+  RGBLEDoff();
 
   // print the banner... 
   Serial.begin(115200);  
   unsigned long waitTime = millis()+500;
   while(millis() < waitTime) yield();                 // wait 500 milliseconds for the serial port
    
-  Serial.printf("\n\n%s\n",title);
+  Serial.printf("\n\n%s Version %s\n",title,VERSION);
+  Serial.printf("Chip ID: %u\n",ESP.getChipId());
+  Serial.printf("CPU Frequency: %u\n",ESP.getCpuFreqMHz());    
   Serial.printf("Sketch size: %u\n",ESP.getSketchSize());
   Serial.printf("Free size: %u\n",ESP.getFreeSketchSpace());
   Serial.printf("%s Reset\n",ESP.getResetReason().c_str());
 
   // connect to WiFi...
   Serial.printf("\nConnecting to %s",WIFISSID);
+  startMillis = millis();
   WiFi.begin(WIFISSID,PASSWORD);
   byte waitCount = 60;                                // 60 seconds
   byte lastSeconds = second();
@@ -146,17 +146,14 @@ void setup() {
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      analogWrite(REDLED,255);                        // RGB LED flashes YELLOW while waiting to connect to WiFi
-      analogWrite(GREENLED,255);
-      ledTimer.once_ms(100,RGBLEDoff);
+      setRGBLED(255,255,0);                           // RGB LED flashes YELLOW while waiting to connect to WiFi   
       Serial.print(".");                              // print '.' every second
       if (--waitCount==0) ESP.restart();              // if WiFi not connected after 60 seconds, restart the ESP8266      
     }
   }  
-  Serial.println("\nConnected.");
-  analogWrite(REDLED,0);                              // turn off the RGB LED
-  analogWrite(GREENLED,0);          
-
+  stopMillis = millis();
+  Serial.printf("\nConnected to %s in %s milliseconds\n",WIFISSID,String(stopMillis-startMillis));
+  
   // start TelnetPrint
   TelnetPrint.begin();
   Serial.println("\nTelnetPrint started.");
@@ -201,7 +198,6 @@ void setup() {
         eeRAM.write(i,atoi(p->value().c_str()));
         Serial.printf("%s: %s\n",p->name().c_str(),p->value().c_str());
       }
-
       ESP.restart();                 
     });
 
@@ -211,8 +207,7 @@ void setup() {
       byte seconds = second();  
       if (lastSeconds != seconds) {
         lastSeconds = seconds;
-        analogWrite(BLUELED,255);                     // RGB LED flashes BLUE while waiting for input to the web page
-        ledTimer.once_ms(100,RGBLEDoff);
+        setRGBLED(0,0,255);                           // RGB LED flashes BLUE while waiting to connect to WiFi           
       }
     }
   }
@@ -223,6 +218,7 @@ void setup() {
   NTP.setDayLight(true);                              // yes to daylight saving time   
   NTP.onNTPSyncEvent([](NTPSyncEvent_t event){ntpEvent=event;syncEventTriggered=true;});
   NTP.setInterval(SHORTINTERVAL,LONGINTERVAL);
+  startMillis=millis();  
 
   waitCount = 60;                                     // 60 seconds
   Serial.print("\nWaiting for sync with NTP server");   
@@ -231,9 +227,7 @@ void setup() {
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      analogWrite(REDLED,255);                        // RGB LED flashes PURPLE while waiting to connect to the NTP server
-      analogWrite(BLUELED,255);
-      ledTimer.once_ms(100,RGBLEDoff);
+      setRGBLED(255,0,255);                           // RGB LED flashes PURPLE while waiting to connect to NTP server
       Serial.print(".");                              // print '.' every second
       if (--waitCount==0) ESP.restart();              // if the time is not set after 60 seconds, restart the ESP8266      
     }
@@ -263,14 +257,16 @@ void loop() {
     if (lastSeconds != secs) {
       lastSeconds = secs;   
         if (analogClkTime > now()) {
-          analogWrite(BLUELED,255);                   // RGB LED flashes WHITE while waiting for actual time to catch up to analog clock time                 
-          analogWrite(GREENLED,255);                          
-          analogWrite(REDLED,255);             
+          setRGBLED(255,255,255);                     // RGB LED flashes WHITE while waiting to connect to WiFi                     
       }
       else {
-        analogWrite(activeLED,255);                   // else, RGB LED flashes GREEN (or RED if there's a problem with NTP)
+        if (NTPissue) {
+          setRGBLED(255,0,0);                         // RGB LED flashes RED if there's an issue with the NTP server
+        }
+        else {
+          setRGBLED(0,255,0);                         // RGB LED flashes GREEN
+        }
       }
-      ledTimer.once_ms(100,RGBLEDoff);
     }
 
   // if either ESP8266's internal time or analog clock's time has changed...
@@ -291,12 +287,22 @@ void loop() {
 } // end of loop()
 
 //------------------------------------------------------------------------
-// Ticker callback that turns off the LEDs after 100 milliseconds.
+// flash the RGB LED
+//-------------------------------------------------------------------------
+void setRGBLED(int red,int green,int blue){
+  analogWrite(REDLED,red);
+  analogWrite(GREENLED,green);
+  analogWrite(BLUELED,blue);
+  ledTimer.once_ms(100,RGBLEDoff);    
+}    
+
+//------------------------------------------------------------------------
+// Ticker callback that turns off the RGB LED after 100 milliseconds.
 //-------------------------------------------------------------------------
 void RGBLEDoff(){
-   analogWrite(BLUELED,0);                          
-   analogWrite(GREENLED,0);                          
-   analogWrite(REDLED,0);                          
+  analogWrite(REDLED,0); 
+  analogWrite(GREENLED,0);                          
+  analogWrite(BLUELED,0);                           
 }
 
 //--------------------------------------------------------------------------
@@ -318,8 +324,7 @@ void pulseCoil() {
 }
 
 //------------------------------------------------------------------------
-// Ticker callback that turns off the pulse to the analog clock Lavet motor
-// after 30 milliseconds.
+// Ticker callback that turns off the pulse to the analog clock Lavet motor after 30 milliseconds.
 //-------------------------------------------------------------------------
 void pulseOff() {
   digitalWrite(COIL1,LOW);
@@ -368,24 +373,23 @@ void checkClock() {
 // NTP client event handler
 //--------------------------------------------------------------------------
 void processSyncEvent(NTPSyncEvent_t ntpEvent) {
-  static unsigned long startMillis,stopMillis;
    switch(ntpEvent) {
       case timeSyncd:
          stopMillis = millis();
          Serial.printf("%s responded in %s milliseconds\n",NTPSERVERNAME,String(stopMillis-startMillis));
          TelnetPrint.printf("%s responded in %s milliseconds\n",NTPSERVERNAME,String(stopMillis-startMillis));
          lastSyncTime = NTP.getTimeStr(NTP.getLastNTPSync());
-         activeLED = GREENLED;
+         NTPissue = false;
          break;
       case noResponse:
          Serial.println("Time Sync error: No response from NTP server");
          TelnetPrint.println("Time Sync error: No response from NTP server");      
-         activeLED = REDLED;   
+         NTPissue = true;
          break;
       case invalidAddress:
          Serial.println("Time Sync error: NTP server not reachable");      
          TelnetPrint.println("Time Sync error: NTP server not reachable");
-         activeLED = REDLED;   
+         NTPissue = true;
          break;
       case requestSent:
          startMillis=millis();      
@@ -395,12 +399,12 @@ void processSyncEvent(NTPSyncEvent_t ntpEvent) {
       case errorSending:
          Serial.println("Time Sync error: An error occurred while sending the request to the NTP server");      
          TelnetPrint.println("Time Sync error: An error occurred while sending the request to the NTP server");
-         activeLED = REDLED;   
+         NTPissue = true;
          break;
       case responseError:
          Serial.println("Time Sync error: Wrong response received from the NTP server");
          TelnetPrint.println("Time Sync error: Wrong response received from the NTP server");      
-         activeLED = REDLED;   
+         NTPissue = true;
    }    
 }
 
