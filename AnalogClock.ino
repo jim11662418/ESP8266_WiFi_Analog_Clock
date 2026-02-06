@@ -16,16 +16,19 @@
 //    RGB LED flashes GREEN during normal operation
 //    RGB LED flashes RED if unable to sync with NTP server
 //    RGB LED flashes WHITE while the analog clock's hands are stopped waiting for actual time to catch up
+//    RGB LED shows steady GREEN during OTA update
+//    RGB LED shows steady RED in event of an OTA error
 //
 //--------------------------------------------------------------------------
 
-#include <TimeLib.h>
+#include <TimeLib.h>                                  // https://github.com/PaulStoffregen/Time
 #include <ESP8266WiFi.h>
 #include <NtpClientLib.h>                             // https://github.com/gmag11/NtpClient
 #include <Ticker.h>
 #include <EERAM.h>                                    // https://github.com/MajenkoLibraries/EERAM/
 #include <ESPAsyncWebServer.h>                        // https://github.com/me-no-dev/ESPAsyncWebServer
-#include <TelnetPrint.h>                              // https://github.com/JAndrassy/TelnetStream/
+#include <ESPTelnet.h>                                // https://github.com/LennartHennigs/ESPTelnet
+#include <ArduinoOTA.h>
 
 #define GRAPHIC                                       // display analog clock graphic on status page
 #define SVG                                           // use Scalable Vector Graphics image for the analog clock face 
@@ -44,20 +47,20 @@
 
 #define SDA D1                                        // output to SDA on the EERAM
 #define SCL D2                                        // output to SCL on the EERAM
-#define COIL1 D3                                      // output to clock's lavet motor coil
-#define COIL2 D7                                      // output to clock's lavet motor coil
+#define COIL1 D3                                      // output to clock's Lavet motor coil
+#define COIL2 D7                                      // output to clock's Lavet motor coil
 #define REDLED D5                                     // output to red part of the RGB LED
 #define GREENLED D4                                   // output to green part of the RGB LED
 #define BLUELED D8                                    // output to blue part of the RGB LED
 #define SWITCHPIN D6                                  // input from push button switch
 
-#define TITLE "ESP8266 WiFi Analog Clock Version 2.7"
+#define TITLE "ESP8266 WiFi Analog Clock Version 2.8"
 
 #define DEBOUNCE 50                                   // 50 milliseconds to debounce the pushbutton switch
-#define PULSETIME 30                                  // 30 millisecond pulse for the clock's lavet motor
+#define PULSETIME 30                                  // 30 millisecond pulse for the clock's Lavet motor
 
-#define WIFISSID "**********"
-#define PASSWORD "**********"    
+#define WIFISSID "********"
+#define PASSWORD "********"    
 
 #define HOUR     0x0000                               // address in EERAM for analogClkHour
 #define MINUTE   HOUR+1                               // address in EERAM for analogClkMinute
@@ -66,20 +69,16 @@
 #define CHECK1   HOUR+4                               // address in EERAM for 1st check byte 0xAA
 #define CHECK2   HOUR+5                               // address in EERAM for 2nd check byte 0x55
 
-//#define NTPSERVERNAME "time.aws.com"
-//#define NTPSERVERNAME "time.cloudflare.com"
-//#define NTPSERVERNAME "time.apple.com"
-//#define NTPSERVERNAME "north-america.pool.ntp.org"
-//#define NTPSERVERNAME "time.nist.gov"
-  #define NTPSERVERNAME "time.windows.com"
-//#define NTPSERVERNAME "time.google.com"
-
 #define LONGINTERVAL 600                              // re-sync with the NTP server every 600 seconds
 #define SHORTINTERVAL 10                              // if the time has not been set, re-try the NTP server every 10 seconds
 
+const char* NTPServerNames[] = {"time.windows.com","us.pool.ntp.org","time.aws.com","time.nist.gov","time.cloudflare.com","time.apple.com"};
+int NTPnameIndex = 0;
+const int NTPnameElements = sizeof(NTPServerNames)/sizeof(NTPServerNames[0]);
+
 AsyncWebServer server(80);
+ESPTelnet telnet;
 EERAM eeRAM;
-time_t analogClkTime;
 Ticker pulseTimer,clockTimer,ledTimer;
 NTPSyncEvent_t ntpEvent;
 String lastSyncTime = "";
@@ -94,24 +93,35 @@ byte analogClkWeekday=0;
 byte analogClkDay=0;
 byte analogClkMonth=0;
 byte analogClkYear=0;
-bool NTPissue = false;
+time_t analogClkTime;
+bool NTPerror = false;
 unsigned long startMillis,stopMillis;
 
 // RGB LED colors - https://www.w3schools.com/colors/colors_picker.asp
 int RGBred[]    = {255,0,0};
 int RGBblue[]   = {0,255,0};
 int RGBgreen[]  = {0,0,255};
+int RGBcyan[]   = {0,255,255};
 int RGByellow[] = {255,255,0};
 int RGBpurple[] = {255,0,255};
 int RGBwhite[]  = {255,255,255};
 
 // prototypes
-void ICACHE_RAM_ATTR pinInterruptISR();               // ISR functions should be defined with ICACHE_RAM_ATTR attribute
-void setRGBLED(int* arr);
+void setRGBLED(int* colors);
 void RGBLEDoff();
+void pulseCoil();
 void pulseOff();
 void checkClock();
+void nextNtpServer();
 void processSyncEvent(NTPSyncEvent_t ntpEvent);
+void ICACHE_RAM_ATTR pinInterruptISR();
+void setupOTA();
+void setupTelnet();  
+void onTelnetConnect(String ip);
+void onTelnetDisconnect(String ip);
+void onTelnetReconnect(String ip);
+void onTelnetConnectionAttempt(String ip);
+void onTelnetInput(String str);
 
 //--------------------------------------------------------------------------
 // Setup
@@ -127,8 +137,8 @@ void setup() {
   pinMode(REDLED,OUTPUT);
   pinMode(GREENLED,OUTPUT);
   pinMode(BLUELED,OUTPUT);
-  pulseOff();
-  RGBLEDoff();
+  pulseOff();                                         // turn off outputs to Lavet motor coil
+  RGBLEDoff();                                        // turn off outputs to LEDs
 
   // print the banner... 
   Serial.begin(115200);  
@@ -142,6 +152,18 @@ void setup() {
   Serial.printf("Free size: %u\n",ESP.getFreeSketchSpace());
   Serial.printf("%s Reset\n",ESP.getResetReason().c_str());
 
+  // configure for static IP
+  IPAddress local_IP(192,168,1,151);
+  IPAddress gateway(192,168,1,1);
+  IPAddress subnet(255,255,0,0);
+  if (WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("Static IP Configured.");
+  }
+  else {
+    Serial.println("STA Failed to configure. Restaring...");
+    ESP.restart(); 
+  }  
+
   // connect to WiFi...
   Serial.printf("\nConnecting to %s",WIFISSID);
   startMillis = millis();
@@ -153,28 +175,31 @@ void setup() {
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      setRGBLED(RGByellow);                           // RGB LED flashes YELLOW while waiting to connect to WiFi   
+      setRGBLED(RGByellow);                           // RGB LED flashes YELLOW while waiting to connect to WiFi          
       Serial.print(".");                              // print '.' every second
-      if (--waitCount==0) ESP.restart();              // if WiFi not connected after 60 seconds, restart the ESP8266      
+      if (--waitCount==0) ESP.restart();              // if not connected to WiFi after 60 seconds, restart the ESP8266      
     }
   }  
   stopMillis = millis();
   Serial.printf("\nConnected to %s in %s milliseconds\n",WIFISSID,String(stopMillis-startMillis));
   
-  // start TelnetPrint
-  TelnetPrint.begin();
-  Serial.println("\nTelnetPrint started.");
+  // start telnet
+  setupTelnet();
+  Serial.println("Telnet server started.");
    
   // start AsyncWebServer
   server.begin();
-  Serial.println("\nAsyncWebServer started.");
+  Serial.println("Web server started.");
+
+  setupOTA();
+  Serial.println("OTA started.");
 
   // if previously saved in EERAM, read hour, minute, second and timezone values from EERAM  
   if((eeRAM.read(CHECK1)==0xAA)&&(eeRAM.read(CHECK2)==0x55)){
     Serial.println("\nReading values from EERAM.");
-    analogClkHour = eeRAM.read(HOUR);
-    analogClkMinute = eeRAM.read(MINUTE);
-    analogClkSecond = eeRAM.read(SECOND);
+    analogClkHour     = eeRAM.read(HOUR);
+    analogClkMinute   = eeRAM.read(MINUTE);
+    analogClkSecond   = eeRAM.read(SECOND);
     analogClktimeZone = eeRAM.read(TIMEZONE); 
 
     server.on("/",HTTP_GET,[](AsyncWebServerRequest *request){
@@ -187,7 +212,7 @@ void setup() {
     });  
   }
    
-  // else, get hour, minute, second and timezone values from the setup web page   
+  // the values stored in EERAM are not valid; go get hour, minute, second and timezone from the setup web page   
   else {
     Serial.printf("\nBrowse to %s to set up the Analog Clock.\n\r",WiFi.localIP().toString().c_str());
       
@@ -195,6 +220,7 @@ void setup() {
       request->send_P(200,"text/html",setuppage);
     });
 
+    // when the 'Submit' button is clicked...
     server.on("/post",HTTP_POST,[](AsyncWebServerRequest *request){ 
       request->send_P(200,"text/plain","OK, Bye");
 
@@ -205,41 +231,42 @@ void setup() {
         eeRAM.write(i,atoi(p->value().c_str()));
         Serial.printf("%s: %s\n",p->name().c_str(),p->value().c_str());
       }
-      ESP.restart();                 
+      ESP.restart();                                  // reset the ESP8266 after values from setup web page have been submitted          
     });
 
+     // loop here flashing the blue LED until the ESP8266 is reset after the 'Submit' button on the setup web page is clicked
     lastSeconds = second();
-    while(true) {                                     // loop here until initial values are entered into the web page
+    while(true) {                                     
       yield();        
       byte seconds = second();  
       if (lastSeconds != seconds) {
         lastSeconds = seconds;
-        setRGBLED(RGBblue);                           // RGB LED flashes BLUE while waiting to connect to WiFi           
+        setRGBLED(RGBblue);                           // RGB LED flashes BLUE while waiting to for values from setup web page              
       }
     }
   }
 
   // connect to the NTP server...
   startMillis=millis();                               // let's see how long this takes  
-  NTP.begin(NTPSERVERNAME,-analogClktimeZone,true);   // start the NTP client
+  NTP.begin(NTPServerNames[NTPnameIndex],-analogClktimeZone,true);   // start the NTP client
   NTP.setDSTZone(DST_ZONE_USA);                       // use US rules for switching between standard and daylight saving time
   NTP.setDayLight(true);                              // yes to daylight saving time   
   NTP.onNTPSyncEvent([](NTPSyncEvent_t event){ntpEvent=event;syncEventTriggered=true;});
   NTP.setInterval(SHORTINTERVAL,LONGINTERVAL);
 
-  waitCount = 60;                                     // 60 seconds
-  Serial.print("\nWaiting for sync with NTP server");   
+  waitCount = 60;                                     // allow 60 seconds to connect to NTP server
+  Serial.printf("\nWaiting for connection with %s",NTP.getNtpServerName().c_str());   
   while (timeStatus() != timeSet) {                   // while waiting for the time to be synced and set...
     yield();    
     byte seconds = second();      
     if (lastSeconds != seconds) {
       lastSeconds = seconds;
-      setRGBLED(RGBpurple);                           // RGB LED flashes PURPLE while waiting to connect to NTP server
+      setRGBLED(RGBpurple);                           // LED flashes PURPLE while waiting to connect to NTP server          
       Serial.print(".");                              // print '.' every second
       if (--waitCount==0) ESP.restart();              // if the time is not set after 60 seconds, restart the ESP8266      
     }
   }    
-  Serial.println("\nSynced with "+NTP.getNtpServerName());
+  Serial.printf("\nSynced with %s\n",NTP.getNtpServerName().c_str());
       
   analogClkWeekday=weekday();                         // take initial values for weekday...
   analogClkDay=day();                                 // and day... 
@@ -249,7 +276,7 @@ void setup() {
 
   // lastly, start up 100 millisecond ticker callback used to advance the analog clock's second hand
   clockTimer.attach_ms(100,checkClock);
-
+  
   Serial.printf("\nBrowse to %s for Analog Clock status.\n\n",WiFi.localIP().toString().c_str());                          
 } // end of setup()
 
@@ -258,20 +285,23 @@ void setup() {
 //--------------------------------------------------------------------------
 void loop() {
   static byte lastSeconds=0; 
+  
+  telnet.loop();  
+  ArduinoOTA.handle();
    
   // once each second....
   byte secs = second();  
-    if (lastSeconds != secs) {
+    if (lastSeconds != secs) {                        // if it's been one second...
       lastSeconds = secs;   
         if (analogClkTime > now()) {
-          setRGBLED(RGBwhite);                        // RGB LED flashes WHITE while waiting to connect to WiFi                     
+          setRGBLED(RGBwhite);                        // LED flashes WHITE while waiting to connect to WiFi                     
       }
       else {
-        if (NTPissue) {
-          setRGBLED(RGBred);                          // RGB LED flashes RED if there's an issue with the NTP server
+        if (NTPerror) {
+          setRGBLED(RGBred);                          // LED flashes RED if there's an issue with the NTP server
         }
         else {
-          setRGBLED(RGBgreen);                        // RGB LED flashes GREEN
+          setRGBLED(RGBgreen);                        // LED flashes GREEN
         }
       }
     }
@@ -283,7 +313,7 @@ void loop() {
     NTPtime = NTP.getTimeStr(now());
     clockTime= NTP.getTimeStr(analogClkTime);
     Serial.println(NTPtime+"\t"+clockTime);
-    TelnetPrint.println(NTPtime+"\t"+clockTime);
+    telnet.println(NTPtime+"\t"+clockTime);
   }
     
   // process any NTP events
@@ -377,41 +407,52 @@ void checkClock() {
  }
 
 //--------------------------------------------------------------------------
+// switch to the next NTP server
+//--------------------------------------------------------------------------
+void nextNtpServer(){
+   if (++NTPnameIndex > NTPnameElements-1) NTPnameIndex = 0;
+   NTP.setNtpServerName(NTPServerNames[NTPnameIndex]);
+}
+
+//--------------------------------------------------------------------------
 // NTP client event handler
 //--------------------------------------------------------------------------
 void processSyncEvent(NTPSyncEvent_t ntpEvent) {
    switch(ntpEvent) {
       case timeSyncd:
          stopMillis = millis();
-         Serial.printf("%s responded in %s milliseconds\n",NTPSERVERNAME,String(stopMillis-startMillis));
-         TelnetPrint.printf("%s responded in %s milliseconds\n",NTPSERVERNAME,String(stopMillis-startMillis));
+         Serial.printf("%s responded in %s milliseconds\n",  NTP.getNtpServerName().c_str(),String(stopMillis-startMillis));
+         telnet.printf("%s responded in %s milliseconds\r\n",NTP.getNtpServerName().c_str(),String(stopMillis-startMillis));
          lastSyncTime = NTP.getTimeStr(NTP.getLastNTPSync());
-         NTPissue = false;
+         NTPerror = false;
          break;
       case noResponse:
-         Serial.println("Time Sync error: No response from NTP server");
-         TelnetPrint.println("Time Sync error: No response from NTP server");      
-         NTPissue = true;
+         Serial.printf("Time Sync error: No response from %s\n",  NTP.getNtpServerName().c_str());
+         telnet.printf("Time Sync error: No response from %s\r\n",NTP.getNtpServerName().c_str());      
+         nextNtpServer();                             // use a different NTP server
+         NTPerror = true;
          break;
       case invalidAddress:
-         Serial.println("Time Sync error: NTP server not reachable");      
-         TelnetPrint.println("Time Sync error: NTP server not reachable");
-         NTPissue = true;
+         Serial.printf("Time Sync error: %s not reachable\n",  NTP.getNtpServerName().c_str());      
+         telnet.printf("Time Sync error: %s not reachable\r\n",NTP.getNtpServerName().c_str());
+         nextNtpServer();                             // use a different NTP server
+         NTPerror = true;
          break;
       case requestSent:
          startMillis=millis();      
-         Serial.println("NTP request sent, waiting for response...");
-         TelnetPrint.println("NTP request sent, waiting for response...");      
+         Serial.printf("NTP request sent to %s, waiting for response...\n",  NTP.getNtpServerName().c_str());
+         telnet.printf("NTP request sent to %s, waiting for response...\r\n",NTP.getNtpServerName().c_str());      
          break;
       case errorSending:
-         Serial.println("Time Sync error: An error occurred while sending the request to the NTP server");      
-         TelnetPrint.println("Time Sync error: An error occurred while sending the request to the NTP server");
-         NTPissue = true;
+         Serial.printf("Time Sync error: An error occurred while sending the request to %s\n",  NTP.getNtpServerName().c_str());      
+         telnet.printf("Time Sync error: An error occurred while sending the request to %s\r\n",NTP.getNtpServerName().c_str());
+         NTPerror = true;
          break;
       case responseError:
-         Serial.println("Time Sync error: Wrong response received from the NTP server");
-         TelnetPrint.println("Time Sync error: Wrong response received from the NTP server");      
-         NTPissue = true;
+         Serial.printf("Time Sync error: Wrong response received from %s\n",  NTP.getNtpServerName().c_str());
+         telnet.printf("Time Sync error: Wrong response received from %s\r\n",NTP.getNtpServerName().c_str());      
+         nextNtpServer();                             // use a different NTP server
+         NTPerror = true;
    }    
 }
 
@@ -427,4 +468,93 @@ void ICACHE_RAM_ATTR pinInterruptISR() {              // ISR functions should be
     eeRAM.write(HOUR+i,0);                            // clear eeram     
   }   
   ESP.restart();                                      // restart the ESP8266
+}
+
+//--------------------------------------------------------------------------
+// setup over-the-air updates
+//--------------------------------------------------------------------------
+void setupOTA(){
+  ArduinoOTA.onStart([]() {                           // show steady GREEN LED while updating
+    analogWrite(REDLED,0); 
+    analogWrite(GREENLED,255);                          
+    analogWrite(BLUELED,0);  
+  });
+
+  ArduinoOTA.onEnd([]() {                             // turn off GREEN LED
+    RGBLEDoff();
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    analogWrite(REDLED,255);                           // show steady RED LED in event of OTA error
+    analogWrite(GREENLED,0);                          
+    analogWrite(BLUELED,0);  
+  });  
+  
+  ArduinoOTA.begin();
+}
+
+//--------------------------------------------------------------------------
+// setup Telnet
+//--------------------------------------------------------------------------
+void setupTelnet() {  
+  // passing on functions for various telnet events
+  telnet.onConnect(onTelnetConnect);
+  telnet.onConnectionAttempt(onTelnetConnectionAttempt);
+  telnet.onReconnect(onTelnetReconnect);
+  telnet.onDisconnect(onTelnetDisconnect);
+  telnet.onInputReceived(onTelnetInput);
+
+  Serial.print("Telnet: ");
+  if (telnet.begin(23)) {
+    Serial.println("running");
+  } else {
+    Serial.println("error.");
+  }
+}
+
+// (optional) callback functions for telnet events
+void onTelnetConnect(String ip) {
+  Serial.print("Telnet: ");
+  Serial.print(ip);
+  Serial.println(" connected");
+  
+  telnet.println("\nWelcome " + telnet.getIP());
+  telnet.println("Type 'bye'  to disconnect.");
+}
+
+void onTelnetDisconnect(String ip) {
+  Serial.print("Telnet: ");
+  Serial.print(ip);
+  Serial.println(" disconnected");
+}
+
+void onTelnetReconnect(String ip) {
+  Serial.print("Telnet: ");
+  Serial.print(ip);
+  Serial.println(" reconnected");
+}
+
+void onTelnetConnectionAttempt(String ip) {
+  Serial.print("Telnet: ");
+  Serial.print(ip);
+  Serial.println(" tried to connected");
+}
+
+void onTelnetInput(String str) {
+  // check for reset command
+  if (str == "reset") {
+    telnet.println("\nresetting..."); 
+    Serial.println("\nresetting...");
+    telnet.disconnectClient();
+    ESP.restart();
+  }
+  // disconnect the client
+  else if (str == "bye") {
+    telnet.println("\ndisconnecting...");
+    telnet.disconnectClient();
+  } 
 }
